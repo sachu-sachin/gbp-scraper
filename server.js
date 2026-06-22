@@ -141,95 +141,68 @@ async function scrapeGBPPosts(gbpUrl, maxPosts = MAX_POSTS) {
       return document.title.replace(' - Google Maps', '').trim();
     });
 
-    // ── Navigate to the Updates / Posts tab ──────────────────────────────────
-    let postsFound = false;
+    // ── Open the posts feed ──────────────────────────────────────────────────
+    // Google Maps exposes a business's posts via a "See local posts" /
+    // "Latest updates" affordance (NOT a normal tab). Find and click it.
+    let postsOpened = false;
+    try {
+      const handle = await page.evaluateHandle(() => {
+        const els = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+        return els.find(e => /see local posts|latest updates|from the owner|updates/i
+          .test(((e.getAttribute('aria-label') || '') + ' ' + (e.innerText || '')))) || null;
+      });
+      const el = handle.asElement();
+      if (el) { await el.click(); postsOpened = true; await sleep(3000); }
+      await handle.dispose();
+    } catch (_) {}
 
-    // Try clicking the "Updates" tab
-    const tabSelectors = [
-      'button[aria-label="Updates"]',
-      'button[data-tab-index]',
-      '[role="tab"]',
-    ];
-
-    for (const sel of tabSelectors) {
-      try {
-        const tabs = await page.$$(sel);
-        for (const tab of tabs) {
-          const label = await page.evaluate(el => el.innerText || el.getAttribute('aria-label') || '', tab);
-          if (/updates|posts|what.s new/i.test(label)) {
-            await tab.click();
-            await sleep(2000);
-            postsFound = true;
-            break;
-          }
-        }
-        if (postsFound) break;
-      } catch (_) {}
-    }
-
-    // ── Scroll to load more posts ─────────────────────────────────────────────
-    await autoScroll(page, 3);
+    // ── Scroll the feed to load more posts ────────────────────────────────────
+    await autoScroll(page, 4);
 
     // ── Extract posts ────────────────────────────────────────────────────────
     const posts = await page.evaluate((max) => {
       const results = [];
 
-      // Selectors for GBP posts (Google updates these periodically)
-      const postContainerSelectors = [
-        '[data-attrid="kc:/local/place:local_update"]',
-        '.m6QErb .WNFist',
-        '.m6QErb [data-update-id]',
-        'div[jsaction*="update"] .Io6YTe',
-        '.K7oBsc',
-        '.Yr7JEd',
-        '.kA9KIf',
-        '[data-local-update-key]',
-      ];
-
-      let postEls = [];
-      for (const sel of postContainerSelectors) {
-        postEls = Array.from(document.querySelectorAll(sel));
-        if (postEls.length > 0) break;
-      }
-
-      // Fallback: look for post-like blocks with text content
+      // Primary: post cards in the Maps "local posts" feed.
+      // (Google renames these classes periodically — update if extraction breaks.)
+      let postEls = Array.from(document.querySelectorAll('.cKbrCd'));
       if (postEls.length === 0) {
-        const allDivs = Array.from(document.querySelectorAll('div[role="article"], .iA8QLe, .Io6YTe'));
-        postEls = allDivs.filter(d => d.innerText && d.innerText.length > 30);
+        for (const sel of ['[data-update-id]', '[data-local-update-key]', '.Rfb4Xc']) {
+          postEls = Array.from(document.querySelectorAll(sel));
+          if (postEls.length) break;
+        }
       }
 
-      for (const el of postEls.slice(0, max)) {
-        const text = el.innerText || '';
-        if (!text.trim()) continue;
+      const seen = new Set();
+      for (const el of postEls) {
+        if (results.length >= max) break;
+        const full = (el.innerText || '').replace(/ /g, ' ').trim();
+        if (!full) continue;
 
-        // Detect post type
-        let postType = "What's New";
-        const lower = text.toLowerCase();
-        if (/offer|discount|sale|% off|coupon|deal/i.test(lower)) postType = 'Offer';
-        else if (/event|workshop|webinar|seminar|bootcamp|class|batch/i.test(lower)) postType = 'Event';
+        // Post body lives in .Rfb4Xc; otherwise use the whole card text
+        const bodyEl = el.querySelector('.Rfb4Xc');
+        let content = (bodyEl ? bodyEl.innerText : full).replace(/\s+/g, ' ').trim();
 
-        // Extract date
+        // Date: "Jun 15, 2026" | "3 days ago" | "Today"/"Yesterday"
         let dateStr = '';
-        const dateEl = el.querySelector('[aria-label*="ago"], .LrzXr, [data-value], time');
-        if (dateEl) {
-          dateStr = dateEl.getAttribute('aria-label') || dateEl.getAttribute('data-value') || dateEl.innerText || '';
-        }
-        if (!dateStr) {
-          const dateMatch = text.match(/\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*\d{0,4}|\d{4}-\d{2}-\d{2}|\d+\s+(?:hour|day|week|month)s?\s+ago)\b/i);
-          if (dateMatch) dateStr = dateMatch[1];
-        }
+        const m = full.match(/\b([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})\b/)
+               || full.match(/\b(\d+\s+(?:hour|day|week|month|year)s?\s+ago)\b/i)
+               || full.match(/\b(Today|Yesterday)\b/);
+        if (m) dateStr = m[1];
 
-        // Clean content
-        const content = text
-          .split('\n')
-          .map(l => l.trim())
-          .filter(l => l.length > 0 && !/^(Like|Share|More|Report)$/i.test(l))
-          .join(' ')
-          .substring(0, 500);
+        // Strip a leading date token if it bled into the body
+        if (dateStr) content = content.replace(dateStr, '').trim();
+        content = content.replace(/^[\s•\-]+/, '').trim();
 
-        if (content.length > 10) {
-          results.push({ type: postType, date: dateStr || 'recent', content });
-        }
+        if (content.length < 8) continue;          // skip empties / UI noise
+        if (seen.has(content)) continue;            // de-dupe
+        seen.add(content);
+
+        let type = "What's New";
+        if (/offer|discount|sale|%\s*off|coupon|deal/i.test(content)) type = 'Offer';
+        else if (/event|workshop|webinar|seminar|bootcamp|class|batch|outing/i.test(content)) type = 'Event';
+
+        results.push({ type, date: dateStr || 'recent', content: content.slice(0, 800) });
       }
 
       return results;
