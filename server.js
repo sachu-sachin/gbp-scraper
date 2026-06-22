@@ -20,6 +20,7 @@ const puppeteerCore = require('puppeteer-core');
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const PORT          = process.env.PORT          || 3000;
+const API_KEY       = process.env.API_KEY       || null;   // if set, required on /scrape* requests
 const CHROME_PATH   = process.env.CHROME_PATH   || findChrome();
 const MAX_POSTS     = process.env.MAX_POSTS      ? parseInt(process.env.MAX_POSTS) : 10;
 const TIMEOUT_MS    = process.env.TIMEOUT_MS     ? parseInt(process.env.TIMEOUT_MS) : 45000;
@@ -282,9 +283,22 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ── Health check
+// ── Health check (always open, no auth — used by monitoring/uptime checks)
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString(), port: PORT });
+});
+
+// ── API token auth (applies to all routes below this point)
+// If API_KEY is set, every request must send the matching token via either:
+//   x-api-key: <token>            OR            Authorization: Bearer <token>
+app.use((req, res, next) => {
+  if (!API_KEY) return next(); // auth disabled when no key configured
+  const headerKey = req.get('x-api-key');
+  const auth      = req.get('authorization') || '';
+  const bearer    = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (headerKey === API_KEY || bearer === API_KEY) return next();
+  console.warn(`[Auth] Rejected ${req.method} ${req.path} from ${req.ip} — bad/missing API key`);
+  return res.status(401).json({ success: false, error: 'Unauthorized: missing or invalid API key' });
 });
 
 // ── Scrape single GBP URL
@@ -366,6 +380,10 @@ app.listen(PORT, async () => {
   console.log(`  POST http://localhost:${PORT}/scrape        → single URL`);
   console.log(`  POST http://localhost:${PORT}/scrape-batch  → multiple URLs`);
   console.log('');
+
+  console.log(API_KEY
+    ? '[Auth] API key required on /scrape and /scrape-batch (x-api-key header).'
+    : '[Auth] WARNING: no API_KEY set — endpoints are OPEN to anyone who can reach the port.');
 
   if (!CHROME_PATH) {
     console.warn('[WARNING] Chrome/Chromium not found automatically.');

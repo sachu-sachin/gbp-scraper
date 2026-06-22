@@ -13,8 +13,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "puppeteer-core": "^21.0.0",
-    "@puppeteer/browser": "^21.0.0"
+    "puppeteer-core": "^21.0.0"
   },
   "engines": {
     "node": "18.x"
